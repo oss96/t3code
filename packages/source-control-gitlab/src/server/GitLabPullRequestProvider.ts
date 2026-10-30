@@ -184,6 +184,25 @@ export const make = Effect.gen(function* () {
         ),
       );
 
+  // REST omits line counts; the CLI recovers optional stats failures per batch.
+  const mergeRequestWithStats = (
+    input: {
+      readonly cwd: string;
+      readonly repository: string;
+      readonly number: number;
+    },
+    detail = cli.getMergeRequestDetail(input),
+  ) =>
+    Effect.all([detail, cli.listMergeRequestStats({ cwd: input.cwd, changeRequests: [input] })], {
+      concurrency: 2,
+    }).pipe(
+      Effect.map(([mergeRequest, [stat]]) =>
+        stat === undefined
+          ? mergeRequest
+          : { ...mergeRequest, additions: stat.additions, deletions: stat.deletions },
+      ),
+    );
+
   const provider: PullRequestProviderApi = {
     kind: SourceControlProviderKind.make("gitlab"),
     capabilities: CAPABILITIES,
@@ -222,6 +241,14 @@ export const make = Effect.gen(function* () {
           Effect.mapError(fail("listChangeRequests")),
         ),
 
+    getFileStats: (input) =>
+      cli.getMergeRequestFileStats(input).pipe(Effect.mapError(fail("getFileStats"))),
+
+    listChangeRequestStats: (input) =>
+      cli
+        .listMergeRequestStats({ cwd: input.cwd, changeRequests: input.changeRequests })
+        .pipe(Effect.mapError(fail("listChangeRequestStats"))),
+
     getChangeRequestChecks: (input) =>
       mergeRequestDetail(input).pipe(
         Effect.map(({ state, checks }) => ({ state, checks })),
@@ -235,7 +262,7 @@ export const make = Effect.gen(function* () {
     getChangeRequestSummary: (input) =>
       Effect.all(
         [
-          cli.getMergeRequestDetail(input),
+          mergeRequestWithStats(input),
           reviewDecisions({
             cwd: input.cwd,
             repository: input.repository,
@@ -251,7 +278,7 @@ export const make = Effect.gen(function* () {
     getChangeRequest: (input) =>
       Effect.all(
         [
-          mergeRequestDetail(input),
+          mergeRequestWithStats(input, mergeRequestDetail(input)),
           Cache.get(projectMergeCapabilities, JSON.stringify([input.cwd, input.repository])),
         ],
         { concurrency: 2 },
