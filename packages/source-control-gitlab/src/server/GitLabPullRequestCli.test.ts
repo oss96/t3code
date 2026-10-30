@@ -120,13 +120,15 @@ layer("GitLabPullRequestCli.layer", (it) => {
         );
       });
       const cli = yield* GitLabPullRequestCli.GitLabPullRequestCli;
-      const reference = { cwd: "/w", repository: "acme/web" };
+      const reference = { cwd: "/w", repository: "acme/web", host: "gitlab.internal" };
       expect(yield* cli.getReviewDecisions({ ...reference, numbers: [] })).toEqual(new Map());
       expect(mockedExecute).not.toHaveBeenCalled();
       const decisions = yield* cli.getReviewDecisions({
         ...reference,
         numbers: Array.from({ length: 101 }, (_, index) => index + 1),
       });
+      expect(callAt(0).host).toBe(reference.host);
+      expect(callAt(1).host).toBe(reference.host);
       expect(decisions.size).toBe(101);
       expect(decisions.get(101)).toBe("approved");
       expect(mockedExecute).toHaveBeenCalledTimes(2);
