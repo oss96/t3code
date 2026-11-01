@@ -183,13 +183,14 @@ export const make = Effect.gen(function* () {
 
   // The rows were already read, so even a rate limit only leaves their decision unknown.
   const reviewDecisions = (input: Parameters<typeof cli.getReviewDecisions>[0]) =>
-    cli
-      .getReviewDecisions(input)
-      .pipe(
-        Effect.orElseSucceed(
-          (): ReadonlyMap<number, PullRequestReviewDecision | null> => new Map(),
-        ),
-      );
+    cli.getReviewDecisions(input).pipe(
+      Effect.catch((error) =>
+        Effect.logWarning("GitLab merge request approval read failed", {
+          repository: input.repository,
+          reason: error._tag,
+        }).pipe(Effect.as<ReadonlyMap<number, PullRequestReviewDecision | null>>(new Map())),
+      ),
+    );
 
   // REST omits line counts; the CLI recovers optional stats failures per batch.
   const mergeRequestWithStats = (
@@ -355,7 +356,7 @@ export const make = Effect.gen(function* () {
     // through on, and access granted or withdrawn within the minute must count.
     getViewerPermissions: (input) =>
       cli
-        .getMergeRequestDetail(input)
+        .getMergeRequestDetail({ ...input, downstreamChecks: false })
         .pipe(Effect.mapError(fail("getViewerPermissions")), Effect.map(gitLabViewerPermissions)),
 
     forgetChangeRequestReads: (scope) =>

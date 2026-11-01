@@ -8,6 +8,7 @@ import { resolvePullRequestAuthorFilter, VcsProcessExitError } from "@t3tools/co
 import type {
   PullRequestAction,
   PullRequestActor,
+  PullRequestCheck,
   PullRequestComment,
   PullRequestCommit,
   PullRequestInvolvement,
@@ -47,6 +48,7 @@ import {
   decodeProjectUsersJson,
   decodeRepositoryBlobsJson,
   decodeReviewDecisionsJson,
+  decodeTriggerJobChecksJson,
   decodeViewerJson,
   gitLabAwardName,
   MERGE_REQUEST_FILE_STATS_GRAPHQL_QUERY,
@@ -248,6 +250,8 @@ export class GitLabPullRequestCli extends Context.Service<
       readonly host?: string | undefined;
       readonly repository: string;
       readonly number: number;
+      /** `false` skips the trigger job read; the permission check before every write does. */
+      readonly downstreamChecks?: boolean;
     }) => Effect.Effect<GitLabMergeRequestDetail, GitLabPullRequestCliError>;
 
     readonly getReviewDecisions: (input: {
@@ -1009,6 +1013,29 @@ export const make = Effect.gen(function* () {
       }),
     );
 
+  // Best-effort: a trigger job read that fails, or a full page that may have left out the one
+  // whose pipeline failed, adds no rows and leaves the detail as it was.
+  const triggerJobChecks = (input: {
+    readonly cwd: string;
+    readonly pipeline: { readonly id: number; readonly projectId: number };
+  }): Effect.Effect<ReadonlyArray<PullRequestCheck>> =>
+    api({
+      cwd: input.cwd,
+      // `bridges` rather than `trigger_jobs`: GitLab 19.2 deprecates it but still serves it, and
+      // older self-managed installs know no other name.
+      path: `projects/${input.pipeline.projectId}/pipelines/${input.pipeline.id}/bridges?${query([
+        ["per_page", String(MAX_PAGE_SIZE)],
+      ])}`,
+    }).pipe(
+      Effect.map((result) => {
+        const decoded = decodeTriggerJobChecksJson(result.stdout.trim());
+        return Result.isSuccess(decoded) && decoded.success.rawCount < MAX_PAGE_SIZE
+          ? decoded.success.checks
+          : [];
+      }),
+      Effect.orElseSucceed((): ReadonlyArray<PullRequestCheck> => []),
+    );
+
   const projectUsers = (input: {
     readonly cwd: string;
     readonly host?: string | undefined;
@@ -1290,30 +1317,14 @@ export const make = Effect.gen(function* () {
     ReadonlyMap<number, PullRequestReviewDecision | null>,
     GitLabPullRequestCliError
   > =>
-    api({
+    graphqlRead({
       cwd: input.cwd,
       host: input.host,
-      path: "graphql",
-      method: "POST",
-      stdin: JSON.stringify({
-        query: REVIEW_DECISIONS_GRAPHQL_QUERY,
-        variables: { fullPath: input.repository, iids: input.numbers.map(String) },
-      }),
-    }).pipe(
-      Effect.flatMap((result) => {
-        const decoded = decodeReviewDecisionsJson(result.stdout.trim());
-        return Result.isSuccess(decoded)
-          ? Effect.succeed(decoded.success)
-          : Effect.fail(
-              new GitLabMergeRequestReadError({
-                command: "glab",
-                cwd: input.cwd,
-                operation: "getReviewDecisions",
-                cause: decoded.failure,
-              }),
-            );
-      }),
-    );
+      operation: "getReviewDecisions",
+      query: REVIEW_DECISIONS_GRAPHQL_QUERY,
+      variables: { fullPath: input.repository, iids: input.numbers.map(String) },
+      decode: decodeReviewDecisionsJson,
+    });
 
   const viewerUsername = (input: { readonly cwd: string; readonly host?: string | undefined }) =>
     api({ cwd: input.cwd, host: input.host, path: "user" }).pipe(
@@ -1344,7 +1355,19 @@ export const make = Effect.gen(function* () {
       return listPage({ ...input, page, collected: [], cursorAdvance: 0 });
     }),
 
-    getMergeRequestDetail: mergeRequestDetail,
+    getMergeRequestDetail: Effect.fn("GitLabPullRequestCli.getMergeRequestDetail")(
+      function* (input) {
+        const detail = yield* mergeRequestDetail(input);
+        if (input.downstreamChecks === false || detail.headPipeline === undefined) return detail;
+        const downstream = yield* triggerJobChecks({
+          cwd: input.cwd,
+          pipeline: detail.headPipeline,
+        });
+        return downstream.length === 0
+          ? detail
+          : { ...detail, checks: [...detail.checks, ...downstream] };
+      },
+    ),
 
     getReviewDecisions: Effect.fn("GitLabPullRequestCli.getReviewDecisions")(function (input) {
       const batches: Array<ReadonlyArray<number>> = [];
